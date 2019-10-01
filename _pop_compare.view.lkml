@@ -1,4 +1,5 @@
 # Implementation details here: https://github.com/caitlinkedi/Looker-PoP-Comparison
+
 # The SQL generates a list of integers from 0 to the number defined by the user via
 # parameters for both the anchor date range breakdown and the number of time periods
 # being compared.  Then it cross joins them so we have a pair for each segment in each
@@ -7,19 +8,24 @@
 view: _pop_compare {
   label: "PoP Comparison"
   derived_table: {
-    sql:
-      SELECT
-        period_num
-        ,anchor_segment
-      FROM UNNEST(GENERATE_ARRAY(0,{% parameter num_comparison_periods %})) as period_num
-      CROSS JOIN
-        UNNEST(GENERATE_ARRAY(0
-              ,DATETIME_DIFF(DATETIME({% date_end anchor_date_range %})
-                            ,DATETIME({% date_start anchor_date_range %})
-                            ,{% parameter anchor_breakdown_type %}))
-              ) as anchor_segment
-      ;;
+    datagroup_trigger: 12hour_refresh
+    create_process: {
+      sql_step: set date_range =  (select datediff({% parameter anchor_breakdown_type %},TO_DATE({% date_start anchor_date_range %}),TO_DATE({% date_end anchor_date_range %}))) ;;
+      sql_step: CREATE TABLE ${SQL_TABLE_NAME} AS
+        SELECT
+          periods.period_num
+          ,anchors.anchor_segment + 1 as anchor_segment
+        FROM (select seq4() as period_num from table(generator(rowcount => {% parameter num_comparison_periods %}))) as periods
+        CROSS JOIN (select seq4() as anchor_segment from table(generator(rowcount => $date_range))) as anchors
+        ;;
+      }
   }
+
+#       FROM UNNEST(GENERATE_ARRAY(0,{% parameter num_comparison_periods %})) as period_num
+#         UNNEST(GENERATE_ARRAY(0
+#               ,DATETIME_DIFF(DATETIME({% date_end anchor_date_range %})
+#                             ,DATETIME({% date_start anchor_date_range %})
+#                             ,{% parameter anchor_breakdown_type %}))
 
   dimension: period_num {
     hidden: yes
@@ -34,7 +40,7 @@ view: _pop_compare {
     type: date
     label: "1. Anchor date range"
     description: "Select the date range you want to compare. Make sure any other date filters include this period or are removed."
-    }
+  }
   parameter: anchor_breakdown_type {
     type: unquoted
     label: "2. Show totals by"
@@ -44,7 +50,7 @@ view: _pop_compare {
     allowed_value: {label: "Month" value: "MONTH"}
     allowed_value: {label: "Week" value: "WEEK"}
     allowed_value: {label: "Day" value: "DAY"}
-    allowed_value: {label: "Hour" value: "HOUR"}
+#     allowed_value: {label: "Hour" value: "HOUR"}
     default_value: "DAY"}
   parameter: comparison_period_type {
     type: unquoted
@@ -69,15 +75,15 @@ view: _pop_compare {
     hidden: yes
     sql:
       {% if anchor_date_range._is_filtered %}
-        {% if anchor_breakdown_type._parameter_value == 'YEAR' %} '%Y' --YYYY, e.g. 2019
+        {% if anchor_breakdown_type._parameter_value == 'YEAR' %} 'YEAR' --YYYY, e.g. 2019
         {% elsif anchor_breakdown_type._parameter_value == 'MONTH'
-          OR anchor_breakdown_type._parameter_value == 'QUARTER' %} '%b' --MON YYYY, e.g. JUN 2019
-        {% elsif anchor_breakdown_type._parameter_value == 'HOUR' %} '%m/%d %r' --MM/DD 12hrAM/PM, e.g. 06/12 1:00 PM
-        {% else %} '%D' --MM/DD/YY, e.g. 06/12/19
+          OR anchor_breakdown_type._parameter_value == 'QUARTER' %} 'MONTH' --MON YYYY, e.g. JUN 2019
+        {% else %} 'DAY' --MM/DD/YY, e.g. 06/12/19
         {% endif %}
       {% else %} NULL
       {% endif %}
       ;;}
+#         -- {% elsif anchor_breakdown_type._parameter_value == 'HOUR' %} 'MM/DD %r' --MM/DD 12hrAM/PM, e.g. 06/12 1:00 PM
   dimension: cpt_name {
     type: string
     hidden: yes
@@ -97,42 +103,43 @@ view: _pop_compare {
   # for use on a chart axis. Starting with the filter end date, this produces all the date
   # segments needed in the anchor range, then truncates them off to the desired granularity,
   # then formats them based on the definitions in the abt_format dimension above.
-  dimension: anchor_dates_unformatted {
-    hidden: yes
-    type: date_raw
-    sql:
-      {% if anchor_date_range._is_filtered %}
-      DATETIME_TRUNC(DATETIME_ADD(DATETIME({% date_end anchor_date_range %})
-                                  ,INTERVAL -1*${anchor_segment} {% parameter anchor_breakdown_type %}
-                                  )
-                      ,{% parameter anchor_breakdown_type %})
-      {% else %} NULL
-      {% endif %}
-      ;;}
-  dimension: anchor_dates {
-    type: string
-    order_by_field: anchor_dates_unformatted
-    sql:
-      {% if anchor_date_range._is_filtered %}
-      FORMAT_DATETIME(${abt_format},${anchor_dates_unformatted})
-      {% else %} NULL
-      {% endif %}
-      ;;}
+      dimension: anchor_dates_unformatted {
+        hidden: yes
+        type: date_raw
+        sql:
+              {% if anchor_date_range._is_filtered %}
+              TRUNC(
+                DATEADD({% parameter anchor_breakdown_type %}, -1*${anchor_segment},
+                  TO_DATE({% date_end anchor_date_range %})
+                )
+              ,'{% parameter anchor_breakdown_type %}')
+              {% else %} NULL
+              {% endif %}
+              ;;}
+      dimension: anchor_dates {
+        type: string
+        order_by_field: anchor_dates_unformatted
+        sql:
+              {% if anchor_date_range._is_filtered %}
+              DATE_TRUNC(${abt_format},${anchor_dates_unformatted})
+              {% else %} NULL
+              {% endif %}
+              ;;}
 
-  # Give nice names to the comparison periods so they can be shown cleanly on charts.
-  dimension: comparison_period_pivot  {
-    type: string
-    description: "Pivot me! These are the periods being compared."
-    order_by_field: period_num
-    sql:
-      {% if anchor_date_range._is_filtered %}
-      CASE ${period_num}
-        WHEN 0 THEN CONCAT('Anchor ', ${cpt_name})
-        WHEN 1 THEN CONCAT('1 ',${cpt_name}, ' prior')
-        ELSE CONCAT(CAST(${period_num} as STRING),' ',${cpt_name}, 's prior')
-      END
-      {% else %} NULL
-      {% endif %}
-      ;;}
+          # Give nice names to the comparison periods so they can be shown cleanly on charts.
+          dimension: comparison_period_pivot  {
+            type: string
+            description: "Pivot me! These are the periods being compared."
+            order_by_field: period_num
+            sql:
+                  {% if anchor_date_range._is_filtered %}
+                  CASE ${period_num}
+                    WHEN 0 THEN CONCAT('Anchor ', ${cpt_name})
+                    WHEN 1 THEN CONCAT('1 ',${cpt_name}, ' prior')
+                    ELSE CONCAT(CAST(${period_num} as STRING),' ',${cpt_name}, 's prior')
+                  END
+                  {% else %} NULL
+                  {% endif %}
+                  ;;}
 
-}#End View
+            }#End View
